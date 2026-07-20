@@ -18,7 +18,7 @@ A high-performance Pi extension for temporary conversations that do not interrup
 - Closes unresolved parent tool calls with side-only synthetic error results when the snapshot is taken mid-tool.
 - Discards the entire side session on close; no side messages enter the main session JSONL.
 
-Rendering is event-driven. Finalized transcript blocks cache their wrapped lines, streaming invalidates only the active block, and viewport extraction avoids rebuilding the complete transcript.
+Rendering is event-driven. Finalized transcript blocks cache their wrapped lines, transcript heights use a dirty-suffix index for viewport extraction, and the whole overlay frame is memoized so concurrent main-thread paints skip unchanged side UI.
 
 ## Load
 

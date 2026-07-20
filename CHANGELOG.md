@@ -4,6 +4,9 @@
 
 ### Changed
 
+- Memoized whole side-view frames and editor layout so main-thread paints skip unchanged overlays.
+- Indexed transcript heights with dirty-suffix rebuilds for viewport-only extraction.
+- Bounded tool transcript display text at the raw cap without altering session/model results.
 - Propagated parent project-trust into side settings and resource discovery.
 - Fail-closed tool inheritance by provenance (source/path/scope/origin); refuse silent built-in substitution.
 - Captured a synchronous parent snapshot before any await (finalized messages only).

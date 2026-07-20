@@ -374,6 +374,9 @@ export async function createSideConversation(
       }),
     );
 
+    const liveExtensionCommands = () =>
+      session.extensionRunner?.getRegisteredCommands().map((command) => command.invocationName) ?? extensionCommands;
+
     return {
       session,
       transcript,
@@ -383,9 +386,7 @@ export async function createSideConversation(
       restoreUi,
       baselineMessageCount,
       commandNames: () => {
-        const live =
-          session.extensionRunner?.getRegisteredCommands().map((command) => command.invocationName) ??
-          extensionCommands;
+        const live = liveExtensionCommands();
         return [
           ...live,
           ...loader.getPrompts().prompts.map((prompt) => prompt.name),
@@ -393,10 +394,7 @@ export async function createSideConversation(
         ];
       },
       commandKind: (name) => {
-        const live =
-          session.extensionRunner?.getRegisteredCommands().map((command) => command.invocationName) ??
-          extensionCommands;
-        if (live.includes(name)) return "extension";
+        if (liveExtensionCommands().includes(name)) return "extension";
         if (
           loader.getPrompts().prompts.some((prompt) => prompt.name === name) ||
           loader.getSkills().skills.some((skill) => `skill:${skill.name}` === name)

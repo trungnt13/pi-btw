@@ -4,6 +4,10 @@ import { truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 type ItemKind = "user" | "assistant" | "tool" | "system";
 type ToolState = "running" | "success" | "error";
 
+/** Presentation cap for tool rows (raw mode). AgentSession still holds full results. */
+const TOOL_RAW_CAP = 10_000;
+const TOOL_NORMAL_CAP = 1_500;
+
 interface RenderCache {
   width: number;
   version: number;
@@ -52,6 +56,11 @@ function hasNonTextContent(content: unknown): boolean {
   );
 }
 
+function boundToolDisplay(text: string): string {
+  if (text.length <= TOOL_RAW_CAP) return text;
+  return `${text.slice(0, TOOL_RAW_CAP - 3)}...`;
+}
+
 function previewArguments(value: unknown): string {
   const serialized = JSON.stringify(value) ?? "";
   return serialized.length > 180 ? `${serialized.slice(0, 177)}...` : serialized;
@@ -62,6 +71,12 @@ export class SideTranscript {
   private readonly listeners = new Set<() => void>();
   private readonly tools = new Map<string, TranscriptItem>();
   private readonly unsubscribe: () => void;
+  /** Cumulative line ends for the current layout key; rebuilt from dirtyFrom. */
+  private ends: number[] = [];
+  private dirtyFrom = 0;
+  private layoutWidth = -1;
+  private layoutRaw = false;
+  private layoutTheme?: Theme;
   private nextId = 1;
   private currentAssistant?: TranscriptItem;
   private raw = false;
@@ -108,28 +123,30 @@ export class SideTranscript {
       };
     }
 
-    let totalLines = 0;
-    for (let index = 0; index < this.items.length; index++) {
-      totalLines += this.renderItem(this.items[index], index > 0, theme, width).length;
-    }
+    this.ensureHeights(theme, width);
+    const totalLines = this.ends[this.ends.length - 1] ?? 0;
     const start = Math.min(Math.max(0, requestedStart), Math.max(0, totalLines - count));
     const end = start + count;
+    const first = this.firstItemAtOrAfter(start);
     const lines: string[] = [];
-    let offset = 0;
-    for (let index = 0; index < this.items.length; index++) {
+    for (let index = first; index < this.items.length; index++) {
+      const itemStart = index === 0 ? 0 : (this.ends[index - 1] ?? 0);
+      if (itemStart >= end) break;
       const itemLines = this.renderItem(this.items[index], index > 0, theme, width);
-      const itemEnd = offset + itemLines.length;
-      if (itemEnd > start && offset < end) {
-        lines.push(...itemLines.slice(Math.max(0, start - offset), Math.min(itemLines.length, end - offset)));
+      const itemEnd = itemStart + itemLines.length;
+      if (itemEnd > start) {
+        lines.push(...itemLines.slice(Math.max(0, start - itemStart), Math.min(itemLines.length, end - itemStart)));
       }
-      offset = itemEnd;
-      if (offset >= end) break;
     }
     return { lines, totalLines, start };
   }
 
   invalidate(): void {
     for (const item of this.items) item.cache = undefined;
+    this.ends = [];
+    this.dirtyFrom = 0;
+    this.layoutWidth = -1;
+    this.layoutTheme = undefined;
   }
 
   dispose(): void {
@@ -180,12 +197,11 @@ export class SideTranscript {
     }
 
     if (event.type === "tool_execution_start") {
-      const detail = previewArguments(event.args);
       const item = this.append({
         kind: "tool",
         label: event.toolName,
         text: "Running...",
-        detail,
+        detail: previewArguments(event.args),
         toolState: "running",
       });
       this.tools.set(event.toolCallId, item);
@@ -195,7 +211,7 @@ export class SideTranscript {
     if (event.type === "tool_execution_update") {
       const item = this.tools.get(event.toolCallId);
       const text = contentText(event.partialResult.content);
-      if (item && text) this.update(item, text);
+      if (item && text) this.update(item, boundToolDisplay(text));
       return;
     }
 
@@ -205,7 +221,7 @@ export class SideTranscript {
       const text = contentText(event.result.content);
       const fallback = hasNonTextContent(event.result.content) ? "(non-text tool output omitted)" : "(no output)";
       item.toolState = event.isError ? "error" : "success";
-      this.update(item, text || fallback);
+      this.update(item, boundToolDisplay(text || fallback));
       this.tools.delete(event.toolCallId);
       return;
     }
@@ -214,11 +230,7 @@ export class SideTranscript {
       if (event.aborted) {
         this.append({ kind: "system", label: "Compaction aborted", text: event.errorMessage || event.reason });
       } else if (!event.result) {
-        this.append({
-          kind: "system",
-          label: "Compaction failed",
-          text: event.errorMessage || event.reason,
-        });
+        this.append({ kind: "system", label: "Compaction failed", text: event.errorMessage || event.reason });
       } else {
         this.append({ kind: "system", label: "Context compacted", text: event.reason });
       }
@@ -242,6 +254,7 @@ export class SideTranscript {
   private append(input: Omit<TranscriptItem, "id" | "version">): TranscriptItem {
     const item: TranscriptItem = { ...input, id: this.nextId++, version: 1 };
     this.items.push(item);
+    this.markDirty(this.items.length - 1);
     this.notify();
     return item;
   }
@@ -250,7 +263,56 @@ export class SideTranscript {
     item.text = text;
     item.version++;
     item.cache = undefined;
+    const index = this.indexOf(item);
+    if (index >= 0) this.markDirty(index);
     this.notify();
+  }
+
+  private indexOf(item: TranscriptItem): number {
+    for (let index = this.items.length - 1; index >= 0; index--) {
+      if (this.items[index] === item) return index;
+    }
+    return -1;
+  }
+
+  private markDirty(index: number): void {
+    this.dirtyFrom = Math.min(this.dirtyFrom, Math.max(0, index));
+  }
+
+  private ensureHeights(theme: Theme, width: number): void {
+    if (this.layoutWidth !== width || this.layoutRaw !== this.raw || this.layoutTheme !== theme) {
+      this.layoutWidth = width;
+      this.layoutRaw = this.raw;
+      this.layoutTheme = theme;
+      this.dirtyFrom = 0;
+      this.ends = [];
+    }
+    if (this.dirtyFrom >= this.items.length && this.ends.length === this.items.length) return;
+
+    const from = Math.min(this.dirtyFrom, this.items.length);
+    let offset = from === 0 ? 0 : (this.ends[from - 1] ?? 0);
+    this.ends.length = this.items.length;
+    for (let index = from; index < this.items.length; index++) {
+      offset += this.renderItem(this.items[index], index > 0, theme, width).length;
+      this.ends[index] = offset;
+    }
+    this.dirtyFrom = this.items.length;
+  }
+
+  /** First item whose cumulative end is > start (covers the start offset). */
+  private firstItemAtOrAfter(start: number): number {
+    let low = 0;
+    let high = this.ends.length - 1;
+    let answer = 0;
+    while (low <= high) {
+      const mid = (low + high) >> 1;
+      if ((this.ends[mid] ?? 0) <= start) low = mid + 1;
+      else {
+        answer = mid;
+        high = mid - 1;
+      }
+    }
+    return answer;
   }
 
   private notify(): void {
@@ -276,8 +338,11 @@ export class SideTranscript {
     lines.push(theme.fg(color, item.label) + state);
     if (item.detail) lines.push(truncateToWidth(theme.fg("muted", item.detail), width));
 
-    const limit = this.raw ? 10_000 : 1_500;
-    const text = item.kind === "tool" && item.text.length > limit ? `${item.text.slice(0, limit - 3)}...` : item.text;
+    // Tool text is already bounded to TOOL_RAW_CAP at ingestion.
+    const text =
+      item.kind === "tool" && !this.raw && item.text.length > TOOL_NORMAL_CAP
+        ? `${item.text.slice(0, TOOL_NORMAL_CAP - 3)}...`
+        : item.text;
     if (text.trim()) {
       for (const line of wrapTextWithAnsi(text.trim(), width)) lines.push(truncateToWidth(line, width));
     }

@@ -12,6 +12,15 @@ import type { SideTranscript } from "./transcript.js";
 
 export type ParentStatus = "running" | "finished" | "failed" | "interrupted";
 
+export interface SideViewPatch {
+  parentStatus?: ParentStatus | undefined;
+  modelLabel?: string;
+  thinkingLevel?: string;
+  error?: string | undefined;
+  notice?: string | undefined;
+  closing?: boolean;
+}
+
 interface SideViewOptions {
   tui: TUI;
   theme: Theme;
@@ -50,6 +59,10 @@ export class SideView implements Component, Focusable {
   private closing = false;
   private closed = false;
   private _focused = false;
+  private viewRev = 0;
+  private editorRev = 0;
+  private frameCache?: { key: string; lines: string[] };
+  private editorCache?: { key: string; lines: string[] };
 
   constructor(options: SideViewOptions) {
     this.tui = options.tui;
@@ -76,10 +89,12 @@ export class SideView implements Component, Focusable {
       this.error = undefined;
       this.notice = undefined;
       this.autoScroll = true;
+      this.editorRev++;
+      this.editorCache = undefined;
       options.onSubmit(prompt);
-      this.tui.requestRender();
+      this.bump();
     };
-    this.unsubscribeTranscript = this.transcript.onChange(() => this.tui.requestRender());
+    this.unsubscribeTranscript = this.transcript.onChange(() => this.bump());
   }
 
   get focused(): boolean {
@@ -87,38 +102,70 @@ export class SideView implements Component, Focusable {
   }
 
   set focused(value: boolean) {
+    if (this._focused === value) return;
     this._focused = value;
     this.editor.focused = value;
+    this.editorRev++;
+    this.editorCache = undefined;
+    this.bump();
+  }
+
+  /** Batch presentation updates; keys present with undefined clear the field. */
+  patch(update: SideViewPatch): void {
+    let changed = false;
+    if ("parentStatus" in update && update.parentStatus !== this.parentStatus) {
+      this.parentStatus = update.parentStatus;
+      changed = true;
+    }
+    if ("modelLabel" in update && update.modelLabel !== undefined && update.modelLabel !== this.modelLabel) {
+      this.modelLabel = update.modelLabel;
+      changed = true;
+    }
+    if (
+      "thinkingLevel" in update &&
+      update.thinkingLevel !== undefined &&
+      update.thinkingLevel !== this.thinkingLevel
+    ) {
+      this.thinkingLevel = update.thinkingLevel;
+      changed = true;
+    }
+    if ("error" in update && update.error !== this.error) {
+      this.error = update.error;
+      changed = true;
+    }
+    if ("notice" in update && update.notice !== this.notice) {
+      this.notice = update.notice;
+      changed = true;
+    }
+    if ("closing" in update && update.closing !== undefined && update.closing !== this.closing) {
+      this.closing = update.closing;
+      changed = true;
+    }
+    if (changed) this.bump();
   }
 
   setParentStatus(status: ParentStatus | undefined): void {
-    this.parentStatus = status;
-    this.tui.requestRender();
+    this.patch({ parentStatus: status });
   }
 
   setModel(modelLabel: string): void {
-    this.modelLabel = modelLabel;
-    this.tui.requestRender();
+    this.patch({ modelLabel });
   }
 
   setThinkingLevel(level: string): void {
-    this.thinkingLevel = level;
-    this.tui.requestRender();
+    this.patch({ thinkingLevel: level });
   }
 
   setError(error: string | undefined): void {
-    this.error = error;
-    this.tui.requestRender();
+    this.patch({ error });
   }
 
   setNotice(notice: string | undefined): void {
-    this.notice = notice;
-    this.tui.requestRender();
+    this.patch({ notice });
   }
 
   setClosing(closing: boolean): void {
-    this.closing = closing;
-    this.tui.requestRender();
+    this.patch({ closing });
   }
 
   markClosed(): void {
@@ -132,7 +179,9 @@ export class SideView implements Component, Focusable {
       if (editorEmpty) this.requestClose();
       else {
         this.editor.setText("");
-        this.tui.requestRender();
+        this.editorRev++;
+        this.editorCache = undefined;
+        this.bump();
       }
       return;
     }
@@ -146,42 +195,59 @@ export class SideView implements Component, Focusable {
     }
 
     const maxScroll = Math.max(0, this.lastTotalLines - this.lastViewportHeight);
+    let scrolled = false;
     if (matchesKey(data, "pageUp")) {
       if (maxScroll > 0) {
         this.scrollOffset = Math.max(0, this.scrollOffset - this.lastViewportHeight);
         this.autoScroll = false;
+        scrolled = true;
       }
     } else if (matchesKey(data, "pageDown")) {
       if (maxScroll > 0) {
         this.scrollOffset = Math.min(maxScroll, this.scrollOffset + this.lastViewportHeight);
         this.autoScroll = this.scrollOffset >= maxScroll;
+        scrolled = true;
       }
     } else if (matchesKey(data, "alt+up")) {
       if (maxScroll > 0) {
         this.scrollOffset = Math.max(0, this.scrollOffset - 1);
         this.autoScroll = false;
+        scrolled = true;
       }
     } else if (matchesKey(data, "alt+down")) {
       if (maxScroll > 0) {
         this.scrollOffset = Math.min(maxScroll, this.scrollOffset + 1);
         this.autoScroll = this.scrollOffset >= maxScroll;
+        scrolled = true;
       }
     } else if (matchesKey(data, "ctrl+home")) {
       if (maxScroll > 0) {
         this.scrollOffset = 0;
         this.autoScroll = false;
+        scrolled = true;
       }
     } else if (matchesKey(data, "ctrl+end")) {
       this.scrollOffset = maxScroll;
       this.autoScroll = true;
+      scrolled = true;
     } else {
       this.editor.handleInput(data);
+      this.editorRev++;
+      this.editorCache = undefined;
+      this.bump();
+      return;
     }
-    this.tui.requestRender();
+    if (scrolled) this.bump();
   }
 
   render(width: number): string[] {
     if (width < 8) return [this.theme.fg("dim", "Side (resize terminal)")];
+    const rows = this.tui.terminal.rows;
+    // Auto-scroll reclamps scrollOffset during render; key only on manual offset.
+    const scrollKey = this.autoScroll ? "a" : String(this.scrollOffset);
+    const frameKey = `${width}|${rows}|${this.viewRev}|${scrollKey}`;
+    if (this.frameCache?.key === frameKey) return this.frameCache.lines;
+
     const innerWidth = width - 4;
     const row = (content: string) => {
       const truncated = truncateToWidth(content, innerWidth, "...", true);
@@ -192,9 +258,14 @@ export class SideView implements Component, Focusable {
       this.theme.fg("border", `${left}${middle.repeat(Math.max(0, width - 2))}${right}`);
     const divider = row(this.theme.fg("borderMuted", "─".repeat(innerWidth)));
 
-    // Keep Editor's contiguous cursor-bearing window intact; do not re-clip it.
-    const editorLines = this.editor.render(innerWidth);
-    const maxRows = Math.max(8, Math.floor(this.tui.terminal.rows * 0.85));
+    const editorKey = `${innerWidth}|${rows}|${this.editorRev}|${this._focused ? 1 : 0}`;
+    let editorLines = this.editorCache?.key === editorKey ? this.editorCache.lines : undefined;
+    if (!editorLines) {
+      editorLines = this.editor.render(innerWidth);
+      this.editorCache = { key: editorKey, lines: editorLines };
+    }
+
+    const maxRows = Math.max(8, Math.floor(rows * 0.85));
     const infoLines = Number(this.error !== undefined) + Number(this.notice !== undefined);
     const viewportHeight = Math.max(1, maxRows - 6 - editorLines.length - infoLines);
     this.lastViewportHeight = viewportHeight;
@@ -229,12 +300,17 @@ export class SideView implements Component, Focusable {
     const action = this.closing ? "closing..." : "PgUp/PgDn scroll · Esc abort · empty Ctrl+C/Ctrl+D return";
     lines.push(row(this.theme.fg("dim", `${scroll} · ${action}`)));
     lines.push(horizontal("╰", "─", "╯"));
+
+    this.frameCache = { key: frameKey, lines };
     return lines;
   }
 
   invalidate(): void {
     this.editor.invalidate();
     this.transcript.invalidate();
+    this.editorCache = undefined;
+    this.editorRev++;
+    this.bump();
   }
 
   dispose(): void {
@@ -245,7 +321,14 @@ export class SideView implements Component, Focusable {
   private requestClose(): void {
     if (this.closing || this.closed) return;
     this.closing = true;
-    this.tui.requestRender();
+    this.bump();
     this.onClose();
+  }
+
+  private bump(): void {
+    if (this.closed) return;
+    this.viewRev++;
+    this.frameCache = undefined;
+    this.tui.requestRender();
   }
 }

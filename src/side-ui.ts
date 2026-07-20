@@ -3,6 +3,22 @@ import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 const STATUS_PREFIX = "pi-btw:";
 const WIDGET_PREFIX = "pi-btw:";
 
+const REJECTED_UI = new Set([
+  "setFooter",
+  "setHeader",
+  "setTitle",
+  "setWorkingMessage",
+  "setWorkingVisible",
+  "setWorkingIndicator",
+  "setHiddenThinkingLabel",
+  "setEditorComponent",
+  "setTheme",
+  "setToolsExpanded",
+  "setEditorText",
+  "pasteToEditor",
+  "addAutocompleteProvider",
+]);
+
 /**
  * Parent UI is process-global. Track transient keyed mutations and reject chrome that would
  * permanently reshape the main TUI after the side closes.
@@ -35,19 +51,9 @@ export function createSideUi(parent: ExtensionUIContext): {
           return (target.setWidget as (k: string, c: unknown, o?: unknown) => void)(scoped, content, options);
         };
       }
-      if (property === "setFooter") return () => reject("setFooter");
-      if (property === "setHeader") return () => reject("setHeader");
-      if (property === "setTitle") return () => reject("setTitle");
-      if (property === "setWorkingMessage") return () => reject("setWorkingMessage");
-      if (property === "setWorkingVisible") return () => reject("setWorkingVisible");
-      if (property === "setWorkingIndicator") return () => reject("setWorkingIndicator");
-      if (property === "setHiddenThinkingLabel") return () => reject("setHiddenThinkingLabel");
-      if (property === "setEditorComponent") return () => reject("setEditorComponent");
-      if (property === "setTheme") return () => reject("setTheme");
-      if (property === "setToolsExpanded") return () => reject("setToolsExpanded");
-      if (property === "setEditorText") return () => reject("setEditorText");
-      if (property === "pasteToEditor") return () => reject("pasteToEditor");
-      if (property === "addAutocompleteProvider") return () => reject("addAutocompleteProvider");
+      if (typeof property === "string" && REJECTED_UI.has(property)) {
+        return () => reject(property);
+      }
 
       const value = Reflect.get(target, property, receiver);
       return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(target) : value;

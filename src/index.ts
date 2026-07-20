@@ -188,16 +188,14 @@ class SideController {
       .then(() => this.routeInput(active, text))
       .catch((error) => {
         if (this.active === active && !active.closing) {
-          active.view?.setNotice(undefined);
-          active.view?.setError(errorMessage(error));
+          active.view?.patch({ notice: undefined, error: errorMessage(error) });
         }
       });
   }
 
   private async routeInput(active: ActiveSide, text: string): Promise<void> {
     if (this.active !== active || active.closing) return;
-    active.view?.setError(undefined);
-    active.view?.setNotice(undefined);
+    active.view?.patch({ error: undefined, notice: undefined });
     const slash = parseSlashInput(text);
     if (!slash) {
       await this.acceptPrompt(active, text, true);
@@ -273,12 +271,9 @@ class SideController {
 
   private syncPresentation(active: ActiveSide): void {
     const model = active.session.model;
-    if (model) {
-      active.modelLabel = `${model.provider}/${model.id}`;
-      active.view?.setModel(active.modelLabel);
-    }
+    if (model) active.modelLabel = `${model.provider}/${model.id}`;
     active.thinkingLevel = active.session.thinkingLevel;
-    active.view?.setThinkingLevel(active.thinkingLevel);
+    active.view?.patch({ modelLabel: active.modelLabel, thinkingLevel: active.thinkingLevel });
   }
 
   private async selectModel(active: ActiveSide, requested: string): Promise<void> {
@@ -323,7 +318,7 @@ class SideController {
     }
     active.session.setThinkingLevel(level as ModelThinkingLevel);
     active.thinkingLevel = level;
-    active.view?.setThinkingLevel(level);
+    active.view?.patch({ thinkingLevel: level });
     active.transcript.appendSystem("Thinking", `Set to ${level}`);
   }
 
@@ -396,8 +391,7 @@ class SideController {
       const failure = await this.settle(active, CLOSE_TIMEOUT_MS);
       if (failure) {
         active.closing = false;
-        active.view?.setClosing(false);
-        active.view?.setError(`Side remains open: ${failure}`);
+        active.view?.patch({ closing: false, error: `Side remains open: ${failure}` });
         return;
       }
       await this.disposeActive(active);
