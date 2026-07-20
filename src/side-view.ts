@@ -43,11 +43,10 @@ export class SideView implements Component, Focusable {
   private thinkingLevel: string;
   private scrollOffset = 0;
   private autoScroll = true;
-  private lastInnerWidth = 80;
   private lastViewportHeight = 8;
+  private lastTotalLines = 1;
   private error?: string;
   private notice?: string;
-  private renderTimer?: ReturnType<typeof setTimeout>;
   private closing = false;
   private closed = false;
   private _focused = false;
@@ -78,9 +77,9 @@ export class SideView implements Component, Focusable {
       this.notice = undefined;
       this.autoScroll = true;
       options.onSubmit(prompt);
-      this.scheduleRender(true);
+      this.tui.requestRender();
     };
-    this.unsubscribeTranscript = this.transcript.onChange(() => this.scheduleRender());
+    this.unsubscribeTranscript = this.transcript.onChange(() => this.tui.requestRender());
   }
 
   get focused(): boolean {
@@ -94,32 +93,32 @@ export class SideView implements Component, Focusable {
 
   setParentStatus(status: ParentStatus | undefined): void {
     this.parentStatus = status;
-    this.scheduleRender();
+    this.tui.requestRender();
   }
 
   setModel(modelLabel: string): void {
     this.modelLabel = modelLabel;
-    this.scheduleRender(true);
+    this.tui.requestRender();
   }
 
   setThinkingLevel(level: string): void {
     this.thinkingLevel = level;
-    this.scheduleRender(true);
+    this.tui.requestRender();
   }
 
   setError(error: string | undefined): void {
     this.error = error;
-    this.scheduleRender(true);
+    this.tui.requestRender();
   }
 
   setNotice(notice: string | undefined): void {
     this.notice = notice;
-    this.scheduleRender(true);
+    this.tui.requestRender();
   }
 
   setClosing(closing: boolean): void {
     this.closing = closing;
-    this.scheduleRender(true);
+    this.tui.requestRender();
   }
 
   markClosed(): void {
@@ -133,7 +132,7 @@ export class SideView implements Component, Focusable {
       if (editorEmpty) this.requestClose();
       else {
         this.editor.setText("");
-        this.scheduleRender(true);
+        this.tui.requestRender();
       }
       return;
     }
@@ -146,36 +145,44 @@ export class SideView implements Component, Focusable {
       return;
     }
 
-    const totalLines = this.transcript.renderSlice(this.theme, this.lastInnerWidth, 0, 0).totalLines;
-    const maxScroll = Math.max(0, totalLines - this.lastViewportHeight);
+    const maxScroll = Math.max(0, this.lastTotalLines - this.lastViewportHeight);
     if (matchesKey(data, "pageUp")) {
-      this.scrollOffset = Math.max(0, this.scrollOffset - this.lastViewportHeight);
-      this.autoScroll = false;
+      if (maxScroll > 0) {
+        this.scrollOffset = Math.max(0, this.scrollOffset - this.lastViewportHeight);
+        this.autoScroll = false;
+      }
     } else if (matchesKey(data, "pageDown")) {
-      this.scrollOffset = Math.min(maxScroll, this.scrollOffset + this.lastViewportHeight);
-      this.autoScroll = this.scrollOffset >= maxScroll;
+      if (maxScroll > 0) {
+        this.scrollOffset = Math.min(maxScroll, this.scrollOffset + this.lastViewportHeight);
+        this.autoScroll = this.scrollOffset >= maxScroll;
+      }
     } else if (matchesKey(data, "alt+up")) {
-      this.scrollOffset = Math.max(0, this.scrollOffset - 1);
-      this.autoScroll = false;
+      if (maxScroll > 0) {
+        this.scrollOffset = Math.max(0, this.scrollOffset - 1);
+        this.autoScroll = false;
+      }
     } else if (matchesKey(data, "alt+down")) {
-      this.scrollOffset = Math.min(maxScroll, this.scrollOffset + 1);
-      this.autoScroll = this.scrollOffset >= maxScroll;
+      if (maxScroll > 0) {
+        this.scrollOffset = Math.min(maxScroll, this.scrollOffset + 1);
+        this.autoScroll = this.scrollOffset >= maxScroll;
+      }
     } else if (matchesKey(data, "ctrl+home")) {
-      this.scrollOffset = 0;
-      this.autoScroll = false;
+      if (maxScroll > 0) {
+        this.scrollOffset = 0;
+        this.autoScroll = false;
+      }
     } else if (matchesKey(data, "ctrl+end")) {
       this.scrollOffset = maxScroll;
       this.autoScroll = true;
     } else {
       this.editor.handleInput(data);
     }
-    this.scheduleRender(true);
+    this.tui.requestRender();
   }
 
   render(width: number): string[] {
-    if (width < 8) return [];
+    if (width < 8) return [this.theme.fg("dim", "Side (resize terminal)")];
     const innerWidth = width - 4;
-    this.lastInnerWidth = innerWidth;
     const row = (content: string) => {
       const truncated = truncateToWidth(content, innerWidth, "...", true);
       const padding = " ".repeat(Math.max(0, innerWidth - visibleWidth(truncated)));
@@ -185,13 +192,9 @@ export class SideView implements Component, Focusable {
       this.theme.fg("border", `${left}${middle.repeat(Math.max(0, width - 2))}${right}`);
     const divider = row(this.theme.fg("borderMuted", "─".repeat(innerWidth)));
 
-    const fullEditorLines = this.editor.render(innerWidth);
+    // Keep Editor's contiguous cursor-bearing window intact; do not re-clip it.
+    const editorLines = this.editor.render(innerWidth);
     const maxRows = Math.max(8, Math.floor(this.tui.terminal.rows * 0.85));
-    const maxEditorLines = Math.max(3, Math.floor(maxRows * 0.35));
-    const editorLines =
-      fullEditorLines.length <= maxEditorLines
-        ? fullEditorLines
-        : [fullEditorLines[0] ?? "", ...fullEditorLines.slice(-(maxEditorLines - 1))];
     const infoLines = Number(this.error !== undefined) + Number(this.notice !== undefined);
     const viewportHeight = Math.max(1, maxRows - 6 - editorLines.length - infoLines);
     this.lastViewportHeight = viewportHeight;
@@ -202,7 +205,7 @@ export class SideView implements Component, Focusable {
       this.autoScroll ? Number.MAX_SAFE_INTEGER : this.scrollOffset,
       viewportHeight,
     );
-    const totalLines = content.totalLines;
+    this.lastTotalLines = content.totalLines;
     this.scrollOffset = content.start;
 
     const statusParts = ["from main thread", parentStatusLabel(this.parentStatus)].filter(
@@ -220,9 +223,9 @@ export class SideView implements Component, Focusable {
     if (this.error) lines.push(row(this.theme.fg("error", `Error: ${this.error}`)));
 
     const scroll =
-      totalLines > viewportHeight
-        ? `${this.scrollOffset + 1}-${Math.min(totalLines, this.scrollOffset + viewportHeight)}/${totalLines}`
-        : `${totalLines} lines`;
+      content.totalLines > viewportHeight
+        ? `${this.scrollOffset + 1}-${Math.min(content.totalLines, this.scrollOffset + viewportHeight)}/${content.totalLines}`
+        : `${content.totalLines} lines`;
     const action = this.closing ? "closing..." : "PgUp/PgDn scroll · Esc abort · empty Ctrl+C/Ctrl+D return";
     lines.push(row(this.theme.fg("dim", `${scroll} · ${action}`)));
     lines.push(horizontal("╰", "─", "╯"));
@@ -236,30 +239,13 @@ export class SideView implements Component, Focusable {
 
   dispose(): void {
     this.closed = true;
-    if (this.renderTimer) clearTimeout(this.renderTimer);
     this.unsubscribeTranscript();
   }
 
   private requestClose(): void {
     if (this.closing || this.closed) return;
     this.closing = true;
-    this.scheduleRender(true);
+    this.tui.requestRender();
     this.onClose();
-  }
-
-  private scheduleRender(immediate = false): void {
-    if (this.closed) return;
-    if (immediate) {
-      if (this.renderTimer) clearTimeout(this.renderTimer);
-      this.renderTimer = undefined;
-      this.tui.requestRender();
-      return;
-    }
-    if (this.renderTimer) return;
-    this.renderTimer = setTimeout(() => {
-      this.renderTimer = undefined;
-      if (!this.closed) this.tui.requestRender();
-    }, 16);
-    this.renderTimer.unref();
   }
 }

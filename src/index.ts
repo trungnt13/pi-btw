@@ -35,6 +35,7 @@ interface ActiveSide extends SideSession {
   promptGate: Promise<void>;
   closeAttempt?: Promise<void>;
   disposePromise?: Promise<void>;
+  closing: boolean;
 }
 
 interface SlashInput {
@@ -51,10 +52,28 @@ function parseSlashInput(text: string): SlashInput | undefined {
   return match ? { name: match[1], args: match[2]?.trim() ?? "" } : undefined;
 }
 
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+    timer.unref();
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
 class SideController {
   private readonly runtime = new SideModelRuntime();
   private active?: ActiveSide;
   private opening = false;
+  private openingPromise?: Promise<void>;
   private parentOutcome?: ParentStatus;
 
   constructor(private readonly pi: ExtensionAPI) {}
@@ -78,14 +97,20 @@ class SideController {
     }
 
     this.opening = true;
+    let settleOpening!: () => void;
+    this.openingPromise = new Promise<void>((resolve) => {
+      settleOpening = resolve;
+    });
     ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg("accent", "Side starting"));
     let active: ActiveSide | undefined;
     try {
       const side = await createSideConversation(this.pi, ctx, this.runtime);
-      const opened: ActiveSide = { ...side, ctx, promptGate: Promise.resolve() };
+      const opened: ActiveSide = { ...side, ctx, promptGate: Promise.resolve(), closing: false };
       active = opened;
       this.active = opened;
       this.opening = false;
+      settleOpening();
+      this.openingPromise = undefined;
       ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg("accent", "Side active"));
       const initialPrompt = args.trim();
 
@@ -123,6 +148,8 @@ class SideController {
       ctx.ui.notify(`Failed to start side conversation: ${errorMessage(error)}`, "error");
     } finally {
       this.opening = false;
+      settleOpening();
+      this.openingPromise = undefined;
       if (active && this.active === active) await this.forceDispose(active);
       else if (!active) ctx.ui.setStatus(STATUS_KEY, undefined);
     }
@@ -130,7 +157,12 @@ class SideController {
 
   parentStarted(): void {
     this.parentOutcome = undefined;
-    this.active?.view?.setParentStatus("running");
+    const active = this.active;
+    active?.view?.setParentStatus("running");
+    active?.transcript.appendSystem(
+      "Main status",
+      "Main conversation started running. Prefer read-only inspection; mutation can race the main agent on the shared working directory.",
+    );
   }
 
   parentAssistantStopped(stopReason: string): void {
@@ -143,6 +175,7 @@ class SideController {
   }
 
   async dispose(): Promise<void> {
+    if (this.openingPromise) await this.openingPromise;
     const active = this.active;
     if (!active) return;
     await this.forceDispose(active);
@@ -150,17 +183,19 @@ class SideController {
   }
 
   private queueInput(active: ActiveSide, text: string): void {
-    if (this.active !== active) return;
+    if (this.active !== active || active.closing) return;
     active.promptGate = active.promptGate
       .then(() => this.routeInput(active, text))
       .catch((error) => {
-        active.view?.setNotice(undefined);
-        active.view?.setError(errorMessage(error));
+        if (this.active === active && !active.closing) {
+          active.view?.setNotice(undefined);
+          active.view?.setError(errorMessage(error));
+        }
       });
   }
 
   private async routeInput(active: ActiveSide, text: string): Promise<void> {
-    if (this.active !== active) return;
+    if (this.active !== active || active.closing) return;
     active.view?.setError(undefined);
     active.view?.setNotice(undefined);
     const slash = parseSlashInput(text);
@@ -220,7 +255,7 @@ class SideController {
     expandPromptTemplates: boolean,
     waitForCompletion = false,
   ): Promise<void> {
-    if (this.active !== active) return;
+    if (this.active !== active || active.closing) return;
     let resolvePreflight: (accepted: boolean) => void = () => {};
     const preflight = new Promise<boolean>((resolve) => {
       resolvePreflight = resolve;
@@ -230,7 +265,7 @@ class SideController {
 
     const run = active.session.prompt(text, options);
     void run.catch((error) => {
-      if (this.active === active) active.view?.setError(errorMessage(error));
+      if (this.active === active && !active.closing) active.view?.setError(errorMessage(error));
     });
     await preflight;
     if (waitForCompletion) await run;
@@ -301,8 +336,9 @@ class SideController {
 
   private showStatus(active: ActiveSide): void {
     const stats = active.session.getSessionStats();
+    const sideMessages = Math.max(0, stats.totalMessages - active.baselineMessageCount);
     active.view?.setNotice(
-      `${active.modelLabel} · ${active.session.thinkingLevel} · ${stats.totalMessages} messages · ${stats.tokens.total} tokens · $${stats.cost.toFixed(4)}`,
+      `${active.modelLabel} · ${active.session.thinkingLevel} · side ${sideMessages} msgs · total ${stats.totalMessages} msgs · ${stats.tokens.total} tokens · $${stats.cost.toFixed(4)}`,
     );
   }
 
@@ -343,8 +379,9 @@ class SideController {
   }
 
   private abortTurn(active: ActiveSide): void {
-    if (this.active !== active || !active.session.isStreaming) return;
+    if (this.active !== active || active.closing) return;
     active.view?.setNotice("Aborting side turn...");
+    active.session.clearQueue();
     void active.session.abort().then(
       () => active.view?.setNotice("Side turn aborted"),
       (error) => active.view?.setError(`Failed to abort: ${errorMessage(error)}`),
@@ -353,10 +390,12 @@ class SideController {
 
   private requestClose(active: ActiveSide): void {
     if (this.active !== active || active.closeAttempt) return;
+    active.closing = true;
     active.view?.setClosing(true);
     active.closeAttempt = (async () => {
       const failure = await this.settle(active, CLOSE_TIMEOUT_MS);
       if (failure) {
+        active.closing = false;
         active.view?.setClosing(false);
         active.view?.setError(`Side remains open: ${failure}`);
         return;
@@ -369,24 +408,29 @@ class SideController {
   }
 
   private async forceDispose(active: ActiveSide): Promise<void> {
+    active.closing = true;
     await this.settle(active, CLOSE_TIMEOUT_MS);
     await this.disposeActive(active);
   }
 
   private async settle(active: ActiveSide, timeoutMs: number): Promise<string | undefined> {
-    if (!active.session.isStreaming) return undefined;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<string>((resolve) => {
-      timer = setTimeout(() => resolve(`abort did not settle within ${timeoutMs}ms`), timeoutMs);
-      timer.unref();
-    });
-    const abort = active.session.abort().then(
-      () => undefined,
-      (error) => errorMessage(error),
-    );
-    const failure = await Promise.race([abort, timeout]);
-    if (timer) clearTimeout(timer);
-    return failure;
+    active.closing = true;
+    active.session.clearQueue();
+
+    const work = (async () => {
+      if (active.session.isStreaming || !active.session.isIdle) {
+        await active.session.abort();
+      }
+      await active.session.waitForIdle();
+      await active.promptGate.catch(() => undefined);
+    })();
+
+    try {
+      await withTimeout(work, timeoutMs, "side settle");
+      return undefined;
+    } catch (error) {
+      return errorMessage(error);
+    }
   }
 
   private disposeActive(active: ActiveSide): Promise<void> {
@@ -395,6 +439,7 @@ class SideController {
       active.view?.markClosed();
       active.transcript.dispose();
       active.session.dispose();
+      active.restoreUi();
       if (this.active === active) this.active = undefined;
       active.ctx.ui.setStatus(STATUS_KEY, undefined);
     });

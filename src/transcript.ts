@@ -19,6 +19,7 @@ interface TranscriptItem {
   text: string;
   detail?: string;
   toolState?: ToolState;
+  copyable?: boolean;
   version: number;
   cache?: RenderCache;
 }
@@ -42,6 +43,13 @@ function contentText(content: unknown): string {
     )
     .map((item) => item.text)
     .join("\n");
+}
+
+function hasNonTextContent(content: unknown): boolean {
+  return (
+    Array.isArray(content) &&
+    content.some((item) => typeof item === "object" && item !== null && (item as { type?: unknown }).type !== "text")
+  );
 }
 
 function previewArguments(value: unknown): string {
@@ -85,7 +93,7 @@ export class SideTranscript {
   lastAssistantText(): string | undefined {
     for (let index = this.items.length - 1; index >= 0; index--) {
       const item = this.items[index];
-      if (item.kind === "assistant" && item.text.trim()) return item.text.trim();
+      if (item.kind === "assistant" && item.copyable !== false && item.text.trim()) return item.text.trim();
     }
     return undefined;
   }
@@ -135,7 +143,7 @@ export class SideTranscript {
       if (event.message.role === "user") {
         this.append({ kind: "user", label: "You", text: contentText(event.message.content) });
       } else if (event.message.role === "assistant") {
-        this.currentAssistant = this.append({ kind: "assistant", label: "Side", text: "" });
+        this.currentAssistant = this.append({ kind: "assistant", label: "Side", text: "", copyable: true });
       } else if (event.message.role === "custom" && event.message.display) {
         this.append({ kind: "system", label: event.message.customType, text: contentText(event.message.content) });
       }
@@ -143,7 +151,7 @@ export class SideTranscript {
     }
 
     if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
-      const item = this.currentAssistant ?? this.append({ kind: "assistant", label: "Side", text: "" });
+      const item = this.currentAssistant ?? this.append({ kind: "assistant", label: "Side", text: "", copyable: true });
       this.currentAssistant = item;
       this.update(item, item.text + event.assistantMessageEvent.delta);
       return;
@@ -151,12 +159,21 @@ export class SideTranscript {
 
     if (event.type === "message_end" && event.message.role === "assistant") {
       const text = contentText(event.message.content);
-      const item = this.currentAssistant ?? this.append({ kind: "assistant", label: "Side", text });
+      const item = this.currentAssistant ?? this.append({ kind: "assistant", label: "Side", text, copyable: true });
       if (item.text !== text && (text || !event.message.errorMessage)) this.update(item, text);
-      if (event.message.errorMessage) {
-        if (item.text.trim())
-          this.append({ kind: "system", label: "Response error", text: event.message.errorMessage });
-        else this.update(item, event.message.errorMessage);
+
+      const stop = event.message.stopReason;
+      if (stop === "length") {
+        this.append({ kind: "system", label: "Incomplete", text: "Response stopped at maximum output tokens." });
+      } else if (stop === "aborted") {
+        this.append({ kind: "system", label: "Aborted", text: event.message.errorMessage || "Side turn aborted." });
+      } else if (stop === "error" || event.message.errorMessage) {
+        const errorText = event.message.errorMessage || "Side response failed.";
+        if (item.text.trim()) this.append({ kind: "system", label: "Response error", text: errorText });
+        else {
+          item.copyable = false;
+          this.update(item, errorText);
+        }
       }
       this.currentAssistant = undefined;
       return;
@@ -185,17 +202,40 @@ export class SideTranscript {
     if (event.type === "tool_execution_end") {
       const item = this.tools.get(event.toolCallId);
       if (!item) return;
-      const text = contentText(event.result.content) || "(no output)";
+      const text = contentText(event.result.content);
+      const fallback = hasNonTextContent(event.result.content) ? "(non-text tool output omitted)" : "(no output)";
       item.toolState = event.isError ? "error" : "success";
-      this.update(item, text);
+      this.update(item, text || fallback);
       this.tools.delete(event.toolCallId);
       return;
     }
 
-    if (event.type === "compaction_end" && !event.aborted && event.result) {
-      this.append({ kind: "system", label: "Context compacted", text: event.reason });
-    } else if (event.type === "auto_retry_start") {
+    if (event.type === "compaction_end") {
+      if (event.aborted) {
+        this.append({ kind: "system", label: "Compaction aborted", text: event.errorMessage || event.reason });
+      } else if (!event.result) {
+        this.append({
+          kind: "system",
+          label: "Compaction failed",
+          text: event.errorMessage || event.reason,
+        });
+      } else {
+        this.append({ kind: "system", label: "Context compacted", text: event.reason });
+      }
+      return;
+    }
+
+    if (event.type === "auto_retry_start") {
       this.append({ kind: "system", label: `Retry ${event.attempt}/${event.maxAttempts}`, text: event.errorMessage });
+      return;
+    }
+
+    if (event.type === "auto_retry_end" && !event.success) {
+      this.append({
+        kind: "system",
+        label: "Retry failed",
+        text: event.finalError || `Attempt ${event.attempt} failed`,
+      });
     }
   }
 

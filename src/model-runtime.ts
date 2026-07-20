@@ -16,20 +16,23 @@ function parentRuntime(registry: Registry): ModelRuntime {
   return candidate as ModelRuntime;
 }
 
+/** Share parent stream/auth identity while blocking provider registry mutations from the side session. */
+export function guardSharedRuntime(runtime: ModelRuntime): ModelRuntime {
+  return new Proxy(runtime, {
+    get(target, property, receiver) {
+      if (property === "registerProvider" || property === "unregisterProvider") {
+        return () => {
+          throw new Error("Provider registration is disabled inside pi-btw side sessions");
+        };
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+    },
+  });
+}
+
 export class SideModelRuntime {
   private runtime?: ModelRuntime;
-
-  async resolve(ctx: ExtensionContext): Promise<{ model: Model<Api>; runtime: ModelRuntime }> {
-    const selected = ctx.model as Model<Api> | undefined;
-    if (!selected) throw new Error("No model is active in the main conversation");
-    const runtime = this.get(ctx.modelRegistry);
-    const available = await runtime.getAvailable();
-    const model = available.find(
-      (candidate) => candidate.provider === selected.provider && candidate.id === selected.id,
-    );
-    if (!model) throw new Error(`Model is unavailable for the side conversation: ${selected.provider}/${selected.id}`);
-    return { model, runtime };
-  }
 
   get(registry: Registry): ModelRuntime {
     const runtime = parentRuntime(registry);
@@ -38,5 +41,16 @@ export class SideModelRuntime {
     }
     this.runtime = runtime;
     return runtime;
+  }
+
+  async resolveModel(runtime: ModelRuntime, selected: Pick<Model<Api>, "provider" | "id">): Promise<Model<Api>> {
+    const available = await runtime.getAvailable();
+    const model = available.find(
+      (candidate) => candidate.provider === selected.provider && candidate.id === selected.id,
+    );
+    if (!model) {
+      throw new Error(`Model is unavailable for the side conversation: ${selected.provider}/${selected.id}`);
+    }
+    return model;
   }
 }
