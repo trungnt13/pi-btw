@@ -25,13 +25,13 @@
   ],
   "peerDependencies": {
     "@earendil-works/pi-ai": "0.80.10",
-    "@earendil-works/pi-coding-agent": "0.80.10",
+    "@earendil-works/pi-coding-agent": "0.99.1",
     "@earendil-works/pi-tui": "0.80.10"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.4",
     "@earendil-works/pi-ai": "0.80.10",
-    "@earendil-works/pi-coding-agent": "0.80.10",
+    "@earendil-works/pi-coding-agent": "0.99.1",
     "@earendil-works/pi-tui": "0.80.10",
     "@types/node": "25.9.5",
     "typescript": "6.0.3"
